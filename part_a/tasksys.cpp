@@ -54,9 +54,8 @@ TaskSystemParallelSpawn::TaskSystemParallelSpawn(int num_threads): ITaskSystem(n
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+    this->num_threads = num_threads;
     threads = new std::thread[num_threads];
-    num_threads = num_threads;
-    // ThreadState* thread_state = new ThreadState(num_threads-1);
 }
 
 TaskSystemParallelSpawn::~TaskSystemParallelSpawn() {}
@@ -76,11 +75,13 @@ void TaskSystemParallelSpawn::run(IRunnable* runnable, int num_total_tasks) {
     //
     int num_tasks_per_thread = num_total_tasks / num_threads;
     for (int i = 0; i < num_threads; i++) {
-        int end = (i+1)*num_tasks_per_thread;
+        int start = i * num_tasks_per_thread;
+        int end = (i + 1) * num_tasks_per_thread;
         if (i == num_threads - 1) {
             end = num_total_tasks;
-        }             
-        threads[i] = std::thread(&TaskSystemParallelSpawn::run_thread, this, runnable, i*num_tasks_per_thread, end, num_total_tasks);
+        }
+
+        threads[i] = std::thread(&TaskSystemParallelSpawn::run_thread, this, runnable, start, end, num_total_tasks);
     }
 
     for (int i=0; i < num_threads; i++) {
