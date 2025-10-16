@@ -60,16 +60,12 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
                                 const std::vector<TaskID>& deps);
         void sync();
     private:
-        std::thread* threads;
-        int num_threads;
-
-        std::mutex task_mutex;
-        IRunnable* current_runnable;
-        int curr_num_tasks;
-
-        // threadsafe counter
-        std::atomic<bool> end_state;
-        std::atomic<int> threads_completed;
+        std::vector<std::thread> threads;
+        std::atomic<bool> end_state{false};
+        std::atomic<IRunnable*> current_runnable{nullptr};
+        std::atomic<int> curr_num_tasks{0};
+        std::atomic<int> next_task_idx{0};
+        std::atomic<int> done_count{0};
         void run_thread(int thread_id);
 };
 

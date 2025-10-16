@@ -111,30 +111,27 @@ const char* TaskSystemParallelThreadPoolSpinning::name() {
 }
 
 void TaskSystemParallelThreadPoolSpinning::run_thread(int thread_id) {
-    while (!end_state) {
-        IRunnable *runnable;
-        int total_num_tasks = 0;
+    for (;;) {
+        if (end_state.load(std::memory_order_relaxed)) break;
 
-        {
-            std::lock_guard<std::mutex> task_lock(task_mutex);
-            runnable = current_runnable;
-            total_num_tasks = curr_num_tasks;
+        IRunnable* r = current_runnable.load(std::memory_order_acquire);
+        if (!r) {
+            std::this_thread::yield();
+            continue;
         }
 
-        if (runnable != nullptr) {
-            int num_tasks_per_thread = total_num_tasks / num_threads;
-            int start = thread_id * num_tasks_per_thread;
-            int end = (thread_id + 1) * num_tasks_per_thread;
-            if (thread_id == num_threads - 1) {
-                end = total_num_tasks;
-            }
-
-            for (int i = start; i < end; i++) {
-                current_runnable->runTask(i, total_num_tasks);
-            }
-
-            threads_completed++;
+        // pull tasks until we run out for THIS job
+        int total = curr_num_tasks.load(std::memory_order_relaxed);
+        int i = next_task_idx.fetch_add(1, std::memory_order_relaxed);
+        if (i >= total) {
+            // no more work right now; yield and re-check runnable next iteration
+            std::this_thread::yield();
+            continue;
         }
+
+        // run using the local snapshot `r` and `total`
+        r->runTask(i, total);
+        done_count.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -145,25 +142,18 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
-    this->num_threads = num_threads;
-    current_runnable = nullptr;
-    curr_num_tasks = 0;
-    end_state = false;
-    threads_completed = 0;
-    threads = new std::thread[num_threads];
-
+    threads.reserve(num_threads);
     for (int i = 0; i < num_threads; i++) {
-        threads[i] = std::thread(&TaskSystemParallelThreadPoolSpinning::run_thread, this, i);
+        threads.emplace_back(&TaskSystemParallelThreadPoolSpinning::run_thread, this, i);
     }
 }
 
 // clean up the threads
 TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
-    end_state = true;
-
-    for (int i=0; i < num_threads; i++) {
-        threads[i].join();
-    }
+    // Tell workers to stop spinning and exit
+    end_state.store(true, std::memory_order_relaxed);
+    current_runnable.store(nullptr, std::memory_order_release);
+    for (auto &t : threads) t.join();
 }
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
@@ -175,21 +165,23 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
     // tasks sequentially on the calling thread.
     //
 
-    {
-        std::lock_guard<std::mutex> task_lock(task_mutex);
-        current_runnable = runnable;
-        curr_num_tasks = num_total_tasks;
+    if (num_total_tasks <= 0) return;
+
+    // 1) reset counters
+    done_count.store(0, std::memory_order_relaxed);
+    next_task_idx.store(0, std::memory_order_relaxed);
+    curr_num_tasks.store(num_total_tasks, std::memory_order_relaxed);
+
+    // 2) publish runnable LAST
+    current_runnable.store(runnable, std::memory_order_release);
+
+    // 3) synchronous wait
+    while (done_count.load(std::memory_order_acquire) < num_total_tasks) {
+        std::this_thread::yield();
     }
 
-    while (threads_completed < num_threads) {
-        // spin
-    }
-
-    {
-        std::lock_guard<std::mutex> task_lock(task_mutex);
-        current_runnable = nullptr;
-        threads_completed = 0;
-    }
+    // 4) park workers
+    current_runnable.store(nullptr, std::memory_order_release);
 
 }
 
