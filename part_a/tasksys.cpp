@@ -110,53 +110,65 @@ const char* TaskSystemParallelThreadPoolSpinning::name() {
     return "Parallel + Thread Pool + Spin";
 }
 
-void TaskSystemParallelThreadPoolSpinning::run_thread(int thread_id) {
+void TaskSystemParallelThreadPoolSpinning::run_thread() {
     while (true) {
-        if (end_state.load(std::memory_order_seq_cst)) break;
-
-        IRunnable* r = current_runnable.load(std::memory_order_seq_cst);
-        if (!r) { std::this_thread::yield(); continue; }
-
-        // Sample job & total
-        int job = current_job_id.load(std::memory_order_seq_cst);
-        int total = curr_num_tasks.load(std::memory_order_seq_cst);
-
-        // Recheck visibility before attempting to reserve
-        if (current_runnable.load(std::memory_order_seq_cst) != r ||
-            current_job_id.load(std::memory_order_seq_cst) != job) {
-            std::this_thread::yield(); continue;
+        if (end_state.load()) {
+            break;
         }
 
-        // CAS-reserve a ticket
+        IRunnable* runnable = current_runnable.load();
+        if (!runnable) { 
+            std::this_thread::yield();
+            continue;
+        }
+
+        int job = current_job_id.load();
+        int total = curr_num_tasks.load();
+        
+        // Recheck visibility before attempting to reserve
+        if (current_runnable.load() != runnable || current_job_id.load() != job)
+        {
+            std::this_thread::yield();
+            continue;
+        }
+
         int i;
         while (true) {
-            int old = next_task_idx.load(std::memory_order_seq_cst);
-            if (old >= total) { i = -1; break; }           // nothing left
-            // bail if job/runnable changed mid-loop
-            if (current_runnable.load(std::memory_order_seq_cst) != r ||
-                current_job_id.load(std::memory_order_seq_cst) != job) {
-                i = -1; break;
+            int old = next_task_idx.load();
+            if (old >= total) { 
+                i = -1;
+                break;
             }
+
+            // bail if job/runnable changed mid-loop
+            if (current_runnable.load() != runnable ||
+                current_job_id.load() != job) 
+            {
+                i = -1;
+                break;
+            }
+
             // try to claim 'old'
-            if (next_task_idx.compare_exchange_weak(
-                    old, old + 1, std::memory_order_seq_cst)) {
+            if (next_task_idx.compare_exchange_weak(old, old + 1)) {
                 i = old;
                 break;
             }
-            // CAS failed → retry
         }
 
-        if (i < 0) { std::this_thread::yield(); continue; }
+        if (i < 0) { 
+            std::this_thread::yield();
+            continue; 
+        }
 
         // Final sanity: if job changed after we claimed, just skip running it.
         // (Since we never incremented done_count, correctness is preserved.)
-        if (current_job_id.load(std::memory_order_seq_cst) != job) {
+        if (current_job_id.load() != job) {
             // we claimed a ticket for a stale job but didn't execute => fine
             continue;
         }
 
-        r->runTask(i, total);
-        done_count.fetch_add(1, std::memory_order_seq_cst);
+        runnable->runTask(i, total);
+        done_count.fetch_add(1);
     }
 }
 
@@ -169,16 +181,18 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
     //
     threads.reserve(num_threads);
     for (int i = 0; i < num_threads; i++) {
-        threads.emplace_back(&TaskSystemParallelThreadPoolSpinning::run_thread, this, i);
+        threads.emplace_back(&TaskSystemParallelThreadPoolSpinning::run_thread, this);
     }
 }
 
 // clean up the threads
 TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
-    // Tell workers to stop spinning and exit
-    end_state.store(true, std::memory_order_seq_cst);
-    current_runnable.store(nullptr, std::memory_order_seq_cst);
-    for (auto &t : threads) t.join();
+    end_state.store(true);
+    current_runnable.store(nullptr);
+
+    for (auto &thread : threads) {
+        thread.join();
+    }
 }
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
@@ -192,20 +206,19 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
 
     if (num_total_tasks <= 0) return;
     
-    done_count.store(0, std::memory_order_seq_cst);
-    next_task_idx.store(0, std::memory_order_seq_cst);
-    curr_num_tasks.store(num_total_tasks, std::memory_order_seq_cst);
+    done_count.store(0);
+    next_task_idx.store(0);
+    curr_num_tasks.store(num_total_tasks);
     
     // Increment job ID to invalidate any in-flight operations
-    current_job_id.fetch_add(1, std::memory_order_seq_cst);
-    current_runnable.store(runnable, std::memory_order_seq_cst);
+    current_job_id.fetch_add(1);
+    current_runnable.store(runnable);
     
-    while (done_count.load(std::memory_order_seq_cst) < num_total_tasks) {
+    while (done_count.load() < num_total_tasks) {
         std::this_thread::yield();
     }
     
-    current_runnable.store(nullptr, std::memory_order_seq_cst);
-
+    current_runnable.store(nullptr);
 }
 
 TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
