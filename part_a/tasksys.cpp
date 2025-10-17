@@ -111,32 +111,50 @@ const char* TaskSystemParallelThreadPoolSpinning::name() {
 }
 
 void TaskSystemParallelThreadPoolSpinning::run_thread(int thread_id) {
-    for (;;) {
+    while (true) {
         if (end_state.load(std::memory_order_seq_cst)) break;
 
         IRunnable* r = current_runnable.load(std::memory_order_seq_cst);
-        if (!r) {
-            std::this_thread::yield();
-            continue;
-        }
+        if (!r) { std::this_thread::yield(); continue; }
 
-        // pull tasks until we run out for THIS job
+        // Sample job & total
+        int job = current_job_id.load(std::memory_order_seq_cst);
         int total = curr_num_tasks.load(std::memory_order_seq_cst);
-        int i = next_task_idx.fetch_add(1, std::memory_order_seq_cst);
-        if (i >= total) {
-            // no more work right now; yield and re-check runnable next iteration
-            std::this_thread::yield();
+
+        // Recheck visibility before attempting to reserve
+        if (current_runnable.load(std::memory_order_seq_cst) != r ||
+            current_job_id.load(std::memory_order_seq_cst) != job) {
+            std::this_thread::yield(); continue;
+        }
+
+        // CAS-reserve a ticket
+        int i;
+        while (true) {
+            int old = next_task_idx.load(std::memory_order_seq_cst);
+            if (old >= total) { i = -1; break; }           // nothing left
+            // bail if job/runnable changed mid-loop
+            if (current_runnable.load(std::memory_order_seq_cst) != r ||
+                current_job_id.load(std::memory_order_seq_cst) != job) {
+                i = -1; break;
+            }
+            // try to claim 'old'
+            if (next_task_idx.compare_exchange_weak(
+                    old, old + 1, std::memory_order_seq_cst)) {
+                i = old;
+                break;
+            }
+            // CAS failed → retry
+        }
+
+        if (i < 0) { std::this_thread::yield(); continue; }
+
+        // Final sanity: if job changed after we claimed, just skip running it.
+        // (Since we never incremented done_count, correctness is preserved.)
+        if (current_job_id.load(std::memory_order_seq_cst) != job) {
+            // we claimed a ticket for a stale job but didn't execute => fine
             continue;
         }
 
-        // re-check runnable to avoid running tasks after main has finished
-        r = current_runnable.load(std::memory_order_seq_cst);
-        if (!r) {
-            std::this_thread::yield();
-            continue;
-        }
-
-        // run using the local snapshot `r` and `total`
         r->runTask(i, total);
         done_count.fetch_add(1, std::memory_order_seq_cst);
     }
@@ -173,28 +191,26 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
     //
 
     if (num_total_tasks <= 0) return;
-
-    // 1) reset counters
+    
     done_count.store(0, std::memory_order_seq_cst);
     next_task_idx.store(0, std::memory_order_seq_cst);
     curr_num_tasks.store(num_total_tasks, std::memory_order_seq_cst);
-
-    // 2) publish runnable LAST
+    
+    // Increment job ID to invalidate any in-flight operations
+    current_job_id.fetch_add(1, std::memory_order_seq_cst);
     current_runnable.store(runnable, std::memory_order_seq_cst);
-
-    // 3) synchronous wait
+    
     while (done_count.load(std::memory_order_seq_cst) < num_total_tasks) {
         std::this_thread::yield();
     }
-
-    // 4) park workers
+    
     current_runnable.store(nullptr, std::memory_order_seq_cst);
 
 }
 
 TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                                               const std::vector<TaskID>& deps) {
-    run(runnable, num_total_tasks);
+    // You do not need to implement this method.
     return 0;
 }
 
