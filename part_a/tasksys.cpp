@@ -132,42 +132,39 @@ void TaskSystemParallelThreadPoolSpinning::run_thread() {
             continue;
         }
 
-        int i;
+        int task_id = -1;
         while (true) {
             int old = next_task_idx.load();
             if (old >= total) { 
-                i = -1;
                 break;
             }
 
             // bail if job/runnable changed mid-loop
             if (current_runnable.load() != runnable ||
-                current_job_id.load() != job) 
-            {
-                i = -1;
+                current_job_id.load() != job) {
                 break;
             }
 
             // try to claim 'old'
             if (next_task_idx.compare_exchange_weak(old, old + 1)) {
-                i = old;
+                task_id = old;
                 break;
             }
         }
 
-        if (i < 0) { 
+        // int task_id = next_task_idx.fetch_add(1);
+
+        if (task_id < 0) { 
             std::this_thread::yield();
             continue; 
         }
 
-        // Final sanity: if job changed after we claimed, just skip running it.
-        // (Since we never incremented done_count, correctness is preserved.)
+        // if job changed after we claimed, don't run it
         if (current_job_id.load() != job) {
-            // we claimed a ticket for a stale job but didn't execute => fine
             continue;
         }
 
-        runnable->runTask(i, total);
+        runnable->runTask(task_id, total);
         done_count.fetch_add(1);
     }
 }
@@ -227,6 +224,7 @@ TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnabl
     return 0;
 }
 
+
 void TaskSystemParallelThreadPoolSpinning::sync() {
     // You do not need to implement this method.
     return;
@@ -249,6 +247,10 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+    threads.reserve(num_threads);
+    for (int i = 0; i < num_threads; i++) {
+        threads.emplace_back(&TaskSystemParallelThreadPoolSleeping::run_thread, this);
+    }
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
@@ -258,6 +260,69 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+    end_state.store(true);
+    current_runnable.store(nullptr);
+
+    for (auto &thread : threads) {
+        thread.join();
+    }
+}
+
+void TaskSystemParallelThreadPoolSleeping::run_thread() {
+    while (true) {
+        if (end_state.load()) {
+            break;
+        }
+
+        IRunnable* runnable = current_runnable.load();
+        if (!runnable) { 
+            std::this_thread::yield();
+            continue;
+        }
+
+        int job = current_job_id.load();
+        int total = curr_num_tasks.load();
+        
+        // Recheck visibility before attempting to reserve
+        if (current_runnable.load() != runnable || current_job_id.load() != job)
+        {
+            std::this_thread::yield();
+            continue;
+        }
+
+        int task_id = -1;
+        while (true) {
+            int old = next_task_idx.load();
+            if (old >= total) { 
+                break;
+            }
+
+            // bail if job/runnable changed mid-loop
+            if (current_runnable.load() != runnable ||
+                current_job_id.load() != job) {
+                break;
+            }
+
+            // try to claim 'old'
+            if (next_task_idx.compare_exchange_weak(old, old + 1)) {
+                task_id = old;
+                break;
+            }
+        }
+
+        if (task_id < 0) { 
+            std::this_thread::yield();
+            continue; 
+        }
+
+        // if job changed after we claimed, don't run it
+        if (current_job_id.load() != job) {
+            continue;
+        }
+
+        runnable->runTask(task_id, total);
+        done_count.fetch_add(1);
+    }
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {

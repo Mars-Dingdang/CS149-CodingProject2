@@ -67,6 +67,7 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         std::atomic<int> next_task_idx{0};
         std::atomic<int> done_count{0};
         std::atomic<int> current_job_id{0};
+
         void run_thread();
 };
 
@@ -85,6 +86,19 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        std::vector<std::thread> threads;
+        std::atomic<bool> end_state{false};
+        std::atomic<IRunnable*> current_runnable{nullptr};
+        std::atomic<int> curr_num_tasks{0};
+        std::atomic<int> next_task_idx{0};
+        std::atomic<int> done_count{0};
+        std::atomic<int> current_job_id{0};
+
+        std::condition_variable condition_variable;
+        std::atomic<int> num_sleeping_threads;
+
+        void run_thread();
 };
 
 #endif
