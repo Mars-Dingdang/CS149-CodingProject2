@@ -1,6 +1,8 @@
 #include "tasksys.h"
 #include <thread>
 #include <vector>
+#include <mutex>
+#include <condition_variable>
 
 
 IRunnable::~IRunnable() {}
@@ -196,13 +198,19 @@ const char* TaskSystemParallelThreadPoolSleeping::name() {
     return "Parallel + Thread Pool + Sleep";
 }
 
-TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads) {
+TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads), num_threads(num_threads), is_killed(false), current_runnable(nullptr), current_num_total_tasks(0), tasks_dispatched(0), tasks_done(0) {
     //
     // TODO: CS149 student implementations may decide to perform setup
     // operations (such as thread pool construction) here.
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+
+    workers.reserve(num_threads);
+    for(int i = 0; i < num_threads; ++ i) {
+        workers.emplace_back(&TaskSystemParallelThreadPoolSleeping::workerLoop, this);
+    }
+
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
@@ -212,6 +220,16 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        is_killed = true;
+    }
+    worker_cv.notify_all(); // wake up all sleeping worker thread to see is_killed == true and exit
+    for(auto &worker : workers) {
+        if(worker.joinable()) worker.join();
+    }
+
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
@@ -223,8 +241,49 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
     // tasks sequentially on the calling thread.
     //
 
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        current_runnable = runnable;
+        this->current_num_total_tasks = num_total_tasks;
+        this->tasks_dispatched = 0;
+        this->tasks_done = 0;
+    }
+    worker_cv.notify_all(); // wake up all waiting worker threads to grab tasks
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        main_cv.wait(lock, [this](){
+            return this->tasks_done == this->current_num_total_tasks;
+        });
+    }
+
+    // for (int i = 0; i < num_total_tasks; i++) {
+    //     runnable->runTask(i, num_total_tasks);
+    // }
+}
+
+void TaskSystemParallelThreadPoolSleeping::workerLoop() {
+    while(1) {
+        int task_id = -1;
+        int num_total_tasks = 0;
+        IRunnable *runnable = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            worker_cv.wait(lock, [this](){
+                return is_killed || tasks_dispatched < current_num_total_tasks;
+            });
+            if(is_killed && tasks_dispatched >= current_num_total_tasks) return ;
+            task_id = tasks_dispatched ++;
+            num_total_tasks = current_num_total_tasks;
+            runnable = current_runnable;
+        }
+        if(runnable != nullptr) {
+            runnable->runTask(task_id, num_total_tasks);
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                tasks_done ++;
+                if(tasks_done == num_total_tasks) main_cv.notify_all();
+            }
+        }
     }
 }
 
